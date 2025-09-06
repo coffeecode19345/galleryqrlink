@@ -2,3 +2,4 @@ pillow
 pyzbar
 opencv-python
 streamlit
+ultralytics
