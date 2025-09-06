@@ -6,34 +6,31 @@ import uuid
 import mimetypes
 import base64
 import os
-import numpy as np
-import tempfile
-
-# Check for QR code dependencies
 try:
+    from pyzbar import pyzbar
     import cv2
-    # Use OpenCV's built-in QR code detector (available in OpenCV 4.x)
+    import numpy as np
     QR_CODE_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    st.error(f"QR code reading is disabled due to missing dependencies: {str(e)}. Install 'pyzbar', 'opencv-python', and ensure 'libzbar0' is installed.")
     QR_CODE_AVAILABLE = False
-
-# Check for ML dependencies
 try:
     from ultralytics import YOLO
     ML_QR_DETECTION_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    st.warning(f"Machine learning QR detection is disabled: {str(e)}. Install 'ultralytics' for enhanced QR code region detection.")
     ML_QR_DETECTION_AVAILABLE = False
 
-# App configuration
 DB_PATH = "qr_gallery.db"
 MAX_FILE_SIZE_MB = 5
+MODEL_PATH = "yolo_qr.pt"  # Update to your fine-tuned model or use "yolov8n.pt"
 
 # -------------------------------
 # Helper Functions
 # -------------------------------
 def image_to_base64(image_data):
     """Convert image data (bytes) to base64 string."""
-    return base64.b64encode(image_data).decode('utf-8') if isinstance(image_data, bytes) else image_data
+    return base64.b64encode(image_data).decode('utf-8') if isinstance(image_data, bytes) else image_data.encode('utf-8')
 
 def validate_file(file):
     """Validate uploaded file size and type."""
@@ -41,19 +38,10 @@ def validate_file(file):
     if file_size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024:
         st.error(f"File '{file.name}' exceeds {MAX_FILE_SIZE_MB}MB limit.")
         return False
-    
-    # Check file type
-    if hasattr(file, 'type') and file.type:
-        file_type = file.type
-    else:
-        _, ext = os.path.splitext(file.name)
-        file_type = ext.lower()
-    
+    file_type = file.type if hasattr(file, 'type') and file.type else os.path.splitext(file.name)[1].lower()
     if file_type not in ['image/jpeg', 'image/png', '.jpg', '.jpeg', '.png']:
         st.error(f"File '{file.name}' must be JPG or PNG.")
         return False
-    
-    # Verify image integrity
     try:
         file.seek(0)
         Image.open(file).verify()
@@ -61,89 +49,120 @@ def validate_file(file):
     except Exception as e:
         st.error(f"File '{file.name}' is invalid or corrupted: {str(e)}")
         return False
-    
     return True
 
 def preprocess_image(cv2_img):
     """Preprocess image to improve QR code detection."""
-    if not QR_CODE_AVAILABLE:
-        return None
-        
     try:
         gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                      cv2.THRESH_BINARY, 11, 2)
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
         return thresh
-    except Exception:
-        return None
+    except Exception as e:
+        st.warning(f"Image preprocessing failed: {str(e)}")
+        return cv2_img
 
 def detect_qr_region(cv2_img):
     """Detect QR code region using YOLOv8."""
     if not ML_QR_DETECTION_AVAILABLE:
         return None
-        
     try:
-        # Try to load a pre-trained model
-        model = YOLO("yolov8n.pt")
-        results = model(cv2_img, conf=0.5)
-        
+        model_path = MODEL_PATH if os.path.exists(MODEL_PATH) else "yolov8n.pt"
+        model = YOLO(model_path)
+        results = model(cv2_img, classes=[0], conf=0.5)  # Adjust class ID and confidence
         for result in results:
-            if hasattr(result, 'boxes') and result.boxes is not None:
-                boxes = result.boxes.xyxy.cpu().numpy()
-                if len(boxes) > 0:
-                    x1, y1, x2, y2 = map(int, boxes[0][:4])
-                    return (x1, y1, x2-x1, y2-y1)
+            boxes = result.boxes.xyxy.cpu().numpy()
+            if len(boxes) > 0:
+                x1, y1, x2, y2 = map(int, boxes[0][:4])
+                return (x1, y1, x2-x1, y2-y1)
         return None
-    except Exception:
+    except Exception as e:
+        st.warning(f"ML QR detection failed: {str(e)}")
         return None
 
 def read_qr_code(file, zoom_region=None):
-    """Read QR code from an uploaded image file using OpenCV's QR code detector."""
+    """Read QR code from an uploaded image file with preprocessing and optional zoom region."""
     if not QR_CODE_AVAILABLE:
         return None, None
-        
     try:
         file.seek(0)
         bytes_data = file.getvalue()
         cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
         if cv2_img is None:
+            st.warning(f"Failed to decode image {file.name}.")
             return None, None
 
-        # Initialize OpenCV QR Code detector
-        qr_detector = cv2.QRCodeDetector()
-        
-        # Try ML-based QR region detection if available
+        # Try ML-based QR region detection
         qr_region = detect_qr_region(cv2_img) if ML_QR_DETECTION_AVAILABLE else None
-        
+        if qr_region:
+            x, y, w, h = qr_region
+            crop = cv2_img[y:y+h, x:x+w]
+            if crop.size > 0:
+                qr_codes = pyzbar.decode(crop)
+                if qr_codes:
+                    return qr_codes[0].data.decode('utf-8'), crop
+                crop_preprocessed = preprocess_image(crop)
+                qr_codes = pyzbar.decode(crop_preprocessed)
+                if qr_codes:
+                    return qr_codes[0].data.decode('utf-8'), crop_preprocessed
+
         # Apply zoom region if provided
         if zoom_region:
             x, y, w, h = zoom_region
             crop = cv2_img[y:y+h, x:x+w]
             if crop.size > 0:
-                decoded_text, points = qr_detector.detectAndDecode(crop)
-                if decoded_text:
-                    return decoded_text, crop
-                
+                qr_codes = pyzbar.decode(crop)
+                if qr_codes:
+                    return qr_codes[0].data.decode('utf-8'), crop
                 crop_preprocessed = preprocess_image(crop)
-                if crop_preprocessed is not None:
-                    decoded_text, points = qr_detector.detectAndDecode(crop_preprocessed)
-                    if decoded_text:
-                        return decoded_text, crop_preprocessed
+                qr_codes = pyzbar.decode(crop_preprocessed)
+                if qr_codes:
+                    return qr_codes[0].data.decode('utf-8'), crop_preprocessed
 
         # Try original image
-        decoded_text, points = qr_detector.detectAndDecode(cv2_img)
-        if decoded_text:
-            return decoded_text, cv2_img
+        qr_codes = pyzbar.decode(cv2_img)
+        if qr_codes:
+            return qr_codes[0].data.decode('utf-8'), cv2_img
 
         # Try preprocessed image
         preprocessed = preprocess_image(cv2_img)
-        if preprocessed is not None:
-            decoded_text, points = qr_detector.detectAndDecode(preprocessed)
-            if decoded_text:
-                return decoded_text, preprocessed
+        qr_codes = pyzbar.decode(preprocessed)
+        if qr_codes:
+            return qr_codes[0].data.decode('utf-8'), preprocessed
+
+        # Try resizing
+        for scale in [0.5, 1.5, 2.0]:
+            resized = cv2.resize(cv2_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            qr_codes = pyzbar.decode(resized)
+            if qr_codes:
+                return qr_codes[0].data.decode('utf-8'), resized
+            resized_preprocessed = preprocess_image(resized)
+            qr_codes = pyzbar.decode(resized_preprocessed)
+            if qr_codes:
+                return qr_codes[0].data.decode('utf-8'), resized_preprocessed
+
+        # Try cropping regions
+        height, width = cv2_img.shape[:2]
+        regions = [
+            (0, 0, width//2, height//2),  # Top-left
+            (width//2, 0, width, height//2),  # Top-right
+            (0, height//2, width//2, height),  # Bottom-left
+            (width//2, height//2, width, height),  # Bottom-right
+        ]
+        for (x, y, w, h) in regions:
+            crop = cv2_img[y:h, x:w]
+            if crop.size == 0:
+                continue
+            qr_codes = pyzbar.decode(crop)
+            if qr_codes:
+                return qr_codes[0].data.decode('utf-8'), crop
+            crop_preprocessed = preprocess_image(crop)
+            qr_codes = pyzbar.decode(crop_preprocessed)
+            if qr_codes:
+                return qr_codes[0].data.decode('utf-8'), crop_preprocessed
 
         return None, cv2_img
-    except Exception:
+    except Exception as e:
+        st.warning(f"Error reading QR code from {file.name}: {str(e)}")
         return None, None
 
 def zoom_image(img, zoom_level, center_x, center_y):
@@ -188,20 +207,24 @@ def init_db():
             FOREIGN KEY(folder) REFERENCES folders(folder)
         )
     """)
-    
-    # Create default folders if they don't exist
     default_folders = [
-        ("general", "General", "General QR code images"),
-        ("marketing", "Marketing", "Marketing campaign QR codes"),
-        ("events", "Events", "Event-related QR codes"),
+        {"name": "General", "description": "General QR code images", "folder": "general"},
+        {"name": "Marketing", "description": "Marketing campaign QR codes", "folder": "marketing"},
+        {"name": "Events", "description": "Event-related QR codes", "folder": "events"},
     ]
-    
-    for folder, name, description in default_folders:
-        c.execute("SELECT COUNT(*) FROM folders WHERE folder = ?", (folder,))
+    for folder_data in default_folders:
+        c.execute("SELECT COUNT(*) FROM folders WHERE folder = ?", (folder_data["folder"],))
         if c.fetchone()[0] == 0:
-            c.execute("INSERT INTO folders (folder, name, description) VALUES (?, ?, ?)",
-                     (folder, name, description))
-    
+            c.execute("""
+                INSERT INTO folders (folder, name, description)
+                VALUES (?, ?, ?)
+            """, (folder_data["folder"], folder_data["name"], folder_data["description"]))
+        else:
+            c.execute("""
+                UPDATE folders
+                SET name = ?, description = ?
+                WHERE folder = ?
+            """, (folder_data["name"], folder_data["description"], folder_data["folder"]))
     conn.commit()
     conn.close()
 
@@ -219,8 +242,10 @@ def add_folder(folder, name, description):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT INTO folders (folder, name, description) VALUES (?, ?, ?)",
-                 (folder, name, description or ""))
+        c.execute("""
+            INSERT INTO folders (folder, name, description)
+            VALUES (?, ?, ?)
+        """, (folder, name, description or ""))
         conn.commit()
         conn.close()
         return True
@@ -236,23 +261,17 @@ def load_images_to_db(uploaded_files, folder):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     uploaded_count = 0
-    
     for uploaded_file in uploaded_files:
         if validate_file(uploaded_file):
             image_data = uploaded_file.read()
             extension = os.path.splitext(uploaded_file.name)[1].lower()
             random_filename = f"{uuid.uuid4()}{extension}"
-            
-            # Try to read QR code if dependencies are available
-            qr_content = None
-            if QR_CODE_AVAILABLE:
-                uploaded_file.seek(0)
-                qr_content, _ = read_qr_code(uploaded_file)
-            
-            c.execute("INSERT INTO images (name, folder, image_data, qr_content) VALUES (?, ?, ?, ?)",
-                     (random_filename, folder, image_data, qr_content))
-            uploaded_count += 1
-    
+            qr_content, _ = read_qr_code(uploaded_file)
+            c.execute("SELECT COUNT(*) FROM images WHERE folder = ? AND name = ?", (folder, random_filename))
+            if c.fetchone()[0] == 0:
+                c.execute("INSERT INTO images (name, folder, image_data, qr_content) VALUES (?, ?, ?, ?)",
+                          (random_filename, folder, image_data, qr_content))
+                uploaded_count += 1
     conn.commit()
     conn.close()
     return uploaded_count
@@ -263,22 +282,14 @@ def get_images(folder):
     c = conn.cursor()
     c.execute("SELECT name, image_data, qr_content FROM images WHERE folder = ?", (folder,))
     images = []
-    
     for r in c.fetchall():
         name, data, qr_content = r
         try:
             img = Image.open(io.BytesIO(data))
             base64_image = image_to_base64(data)
-            images.append({
-                "name": name, 
-                "image": img, 
-                "data": data, 
-                "qr_content": qr_content, 
-                "base64": base64_image
-            })
+            images.append({"name": name, "image": img, "data": data, "qr_content": qr_content, "base64": base64_image})
         except Exception as e:
             st.error(f"Error loading image {name}: {str(e)}")
-    
     conn.close()
     return images
 
@@ -294,7 +305,6 @@ def delete_image(folder, name):
 # Initialize DB & Session State
 # -------------------------------
 init_db()
-
 if "zoom_folder" not in st.session_state:
     st.session_state.zoom_folder = None
 if "zoom_index" not in st.session_state:
@@ -313,7 +323,6 @@ if "zoom_center_y" not in st.session_state:
 # -------------------------------
 with st.sidebar:
     st.title("Admin Login")
-    
     with st.form(key="login_form"):
         pwd = st.text_input("Password", type="password", key="login_password")
         if st.form_submit_button("Login", key="login_button"):
@@ -322,59 +331,45 @@ with st.sidebar:
                 st.success("Logged in as admin!")
             else:
                 st.error("Incorrect password")
-    
     if st.session_state.is_admin and st.button("Logout", key="logout_button"):
         st.session_state.is_admin = False
         st.success("Logged out")
+        st.rerun()
 
     if st.session_state.is_admin:
         st.subheader("Manage Folders & Images")
-        
         # Add Folder
         with st.form(key="add_folder_form"):
             new_folder = st.text_input("Folder Name (e.g., 'newfolder')", key="new_folder_input")
             new_name = st.text_input("Display Name", key="new_name_input")
             new_description = st.text_area("Description (optional)", key="new_description_input")
-            
             if st.form_submit_button("Add Folder", key="add_folder_button"):
                 if new_folder and new_name:
                     if add_folder(new_folder.lower(), new_name, new_description):
                         st.success(f"Folder '{new_folder}' added successfully!")
+                        st.rerun()
                 else:
                     st.error("Folder Name and Display Name are required.")
 
         # Upload Images
         data = load_folders()
         folder_choice = st.selectbox("Select Folder", [item["folder"] for item in data], key="upload_folder_select")
-        
         uploaded_files = st.file_uploader(
-            "Upload QR Code Images", 
-            accept_multiple_files=True, 
-            type=['jpg', 'jpeg', 'png'], 
-            key="upload_files"
+            "Upload QR Code Images", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'], key="upload_files"
         )
-        
         debug_preprocessed = st.checkbox("Show preprocessed images (Admin)", key="debug_preprocessed")
-        
         if st.button("Upload Images", key="upload_button") and uploaded_files:
             uploaded_count = load_images_to_db(uploaded_files, folder_choice)
             st.success(f"{uploaded_count} image(s) uploaded to '{folder_choice}'!")
-            
             if QR_CODE_AVAILABLE:
                 for file in uploaded_files:
-                    file.seek(0)
                     qr_content, processed_img = read_qr_code(file)
                     if qr_content:
                         st.write(f"**{file.name} QR Content:** {qr_content}")
                     else:
                         st.write(f"**{file.name} QR Content:** No QR code detected")
-                    
                     if debug_preprocessed and processed_img is not None and st.session_state.is_admin:
-                        if len(processed_img.shape) == 2:  # Grayscale
-                            processed_pil = Image.fromarray(processed_img)
-                        else:  # Color
-                            processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
-                            
+                        processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
                         st.image(processed_pil, caption=f"Preprocessed {file.name}", use_container_width=True)
 
 # -------------------------------
@@ -382,40 +377,11 @@ with st.sidebar:
 # -------------------------------
 st.markdown("""
 <style>
-.folder-card {
-    background: #f9f9f9; 
-    border-radius: 8px; 
-    padding: 15px; 
-    margin-bottom: 20px; 
-    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-}
-.folder-header {
-    font-size: 1.5em; 
-    color: #333; 
-    margin-bottom: 10px;
-}
-.image-grid {
-    display: flex; 
-    flex-wrap: wrap; 
-    gap: 10px;
-}
-img {
-    border-radius: 4px; 
-    max-width: 100px; 
-    object-fit: cover;
-}
-.qr-content {
-    margin-top: 10px; 
-    word-break: break-all; 
-    font-size: 0.9em;
-}
-.warning-box {
-    background-color: #fff3cd;
-    border: 1px solid #ffeaa7;
-    border-radius: 5px;
-    padding: 10px;
-    margin-bottom: 15px;
-}
+.folder-card {background: #f9f9f9; border-radius: 8px; padding: 15px; margin-bottom: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);}
+.folder-header {font-size:1.5em; color:#333; margin-bottom:10px;}
+.image-grid {display:flex; flex-wrap:wrap; gap:10px;}
+img {border-radius:4px; max-width:100px; object-fit:cover;}
+.qr-content {margin-top:10px; word-break:break-all; font-size:0.9em;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -424,39 +390,23 @@ img {
 # -------------------------------
 st.title("📸 QR Code Image Manager")
 
-# Display dependency warnings if needed
 if not QR_CODE_AVAILABLE:
-    st.markdown("""
-    <div class="warning-box">
-    ⚠️ QR code reading is disabled due to missing dependencies. 
-    Install 'opencv-python' for QR code detection.
-    </div>
-    """, unsafe_allow_html=True)
-
+    st.error("QR code functionality is disabled. Ensure 'pyzbar', 'opencv-python', and 'libzbar0' are installed. See Streamlit Cloud logs or local setup instructions.")
 if not ML_QR_DETECTION_AVAILABLE:
-    st.markdown("""
-    <div class="warning-box">
-    ⚠️ Machine learning QR detection is disabled due to missing 'ultralytics'. 
-    Install 'ultralytics' for enhanced QR code region detection.
-    </div>
-    """, unsafe_allow_html=True)
+    st.warning("Machine learning QR detection is disabled. Install 'ultralytics' for enhanced detection.")
 
 data = load_folders()
-
 if st.session_state.zoom_folder is None:
     # Grid View
     if not data:
         st.info("No folders available. Admins can create folders in the sidebar.")
-    
     for f in data:
         st.markdown(
             f'<div class="folder-card"><div class="folder-header">'
             f'{f["name"]} ({f["description"] or "No description"})</div>',
             unsafe_allow_html=True
         )
-        
         images = get_images(f["folder"])
-        
         if images:
             cols = st.columns(4)
             for idx, img_dict in enumerate(images):
@@ -467,13 +417,20 @@ if st.session_state.zoom_folder is None:
                         st.session_state.zoom_level = 1.0
                         st.session_state.zoom_center_x = 0.5
                         st.session_state.zoom_center_y = 0.5
+                        # Try ML-based QR region detection to initialize zoom
+                        if ML_QR_DETECTION_AVAILABLE and QR_CODE_AVAILABLE:
+                            file = io.BytesIO(img_dict["data"])
+                            cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
+                            qr_region = detect_qr_region(cv2_img)
+                            if qr_region:
+                                x, y, w, h = qr_region
+                                st.session_state.zoom_center_x = (x + w/2) / cv2_img.shape[1]
+                                st.session_state.zoom_center_y = (y + h/2) / cv2_img.shape[0]
+                                st.session_state.zoom_level = max(1.0, min(5.0, cv2_img.shape[1] / w))
                         st.rerun()
-                    
                     st.image(img_dict["image"], use_container_width=True, caption=f"Photo {idx+1}")
-                    
                     qr_display = img_dict["qr_content"] if img_dict["qr_content"] else "No QR code detected"
                     st.markdown(f'<div class="qr-content"><b>QR Content:</b> {qr_display}</div>', unsafe_allow_html=True)
-                    
                     if st.session_state.is_admin:
                         if st.button("🗑️ Delete", key=f"delete_grid_{f['folder']}_{img_dict['name']}"):
                             delete_image(f["folder"], img_dict["name"])
@@ -487,17 +444,11 @@ else:
     folder = st.session_state.zoom_folder
     images = get_images(folder)
     idx = st.session_state.zoom_index
-    
     if idx >= len(images):
         idx = 0
         st.session_state.zoom_index = 0
-    
-    if not images:
-        st.error("No images found in this folder.")
-        st.session_state.zoom_folder = None
-        st.rerun()
-    
     img_dict = images[idx]
+
     st.subheader(f"🔍 Viewing {folder} ({idx+1}/{len(images)})")
     
     # Image Magnifier Controls
@@ -514,35 +465,48 @@ else:
     zoomed_image, zoom_region = zoom_image(img_dict["image"], zoom_level, center_x, center_y)
     st.image(zoomed_image, use_container_width=True, caption="Zoomed Image")
     
-    # Try QR code detection in zoomed region if dependencies are available
+    # Try QR code detection in zoomed region
     qr_display = img_dict["qr_content"] if img_dict["qr_content"] else "No QR code detected"
-    
     if QR_CODE_AVAILABLE and zoom_level > 1.0:
         file = io.BytesIO(img_dict["data"])
         qr_content, processed_img = read_qr_code(file, zoom_region=(zoom_region[0], zoom_region[1], zoom_region[2], zoom_region[3]))
-        
         if qr_content:
             qr_display = qr_content
-            # Update database with new QR content
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             c.execute("UPDATE images SET qr_content = ? WHERE folder = ? AND name = ?",
-                     (qr_content, folder, img_dict["name"]))
+                      (qr_content, folder, img_dict["name"]))
             conn.commit()
             conn.close()
-        
         if st.session_state.is_admin and processed_img is not None:
             with st.expander("Show Preprocessed Zoomed Image"):
-                if len(processed_img.shape) == 2:  # Grayscale
-                    processed_pil = Image.fromarray(processed_img)
-                else:  # Color
-                    processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
-                
+                processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
                 st.image(processed_pil, caption="Preprocessed Zoomed Image")
+
+    # Try ML-based QR detection if no QR code found
+    if QR_CODE_AVAILABLE and ML_QR_DETECTION_AVAILABLE and not qr_display:
+        file = io.BytesIO(img_dict["data"])
+        cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
+        qr_region = detect_qr_region(cv2_img)
+        if qr_region:
+            file.seek(0)
+            qr_content, processed_img = read_qr_code(file, zoom_region=qr_region)
+            if qr_content:
+                qr_display = qr_content
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("UPDATE images SET qr_content = ? WHERE folder = ? AND name = ?",
+                          (qr_content, folder, img_dict["name"]))
+                conn.commit()
+                conn.close()
+                x, y, w, h = qr_region
+                st.session_state.zoom_center_x = (x + w/2) / cv2_img.shape[1]
+                st.session_state.zoom_center_y = (y + h/2) / cv2_img.shape[0]
+                st.session_state.zoom_level = max(1.0, min(5.0, cv2_img.shape[1] / w))
+                st.rerun()
 
     st.markdown(f'<b>QR Content:</b> {qr_display}', unsafe_allow_html=True)
 
-    # Navigation buttons
     col1, col2, col3 = st.columns([1, 8, 1])
     with col1:
         if idx > 0 and st.button("◄ Previous", key=f"prev_{folder}_{idx}"):
@@ -551,7 +515,6 @@ else:
             st.session_state.zoom_center_x = 0.5
             st.session_state.zoom_center_y = 0.5
             st.rerun()
-    
     with col3:
         if idx < len(images)-1 and st.button("Next ►", key=f"next_{folder}_{idx}"):
             st.session_state.zoom_index += 1
@@ -560,30 +523,25 @@ else:
             st.session_state.zoom_center_y = 0.5
             st.rerun()
 
-    # Download button
     mime, _ = mimetypes.guess_type(img_dict["name"])
     st.download_button(
         "⬇️ Download",
         data=img_dict["data"],
         file_name=f"{uuid.uuid4()}{os.path.splitext(img_dict['name'])[1]}",
-        mime=mime or "image/jpeg",
+        mime=mime,
         key=f"download_{folder}_{img_dict['name']}"
     )
 
-    # Delete button for admin
     if st.session_state.is_admin:
         if st.button("🗑️ Delete Image", key=f"delete_zoom_{folder}_{img_dict['name']}"):
             delete_image(folder, img_dict["name"])
             st.success("Image deleted.")
             st.session_state.zoom_index = max(0, idx-1)
-            
             if len(get_images(folder)) == 0:
                 st.session_state.zoom_folder = None
                 st.session_state.zoom_index = 0
-            
             st.rerun()
 
-    # Back to grid button
     if st.button("⬅️ Back to Grid", key=f"back_{folder}_{idx}"):
         st.session_state.zoom_folder = None
         st.session_state.zoom_index = 0
