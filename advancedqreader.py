@@ -14,9 +14,16 @@ try:
 except ImportError as e:
     st.warning("QR code reading is disabled due to missing dependencies. Install 'pyzbar' and 'opencv-python' and ensure 'libzbar0' is installed.")
     QR_CODE_AVAILABLE = False
+try:
+    from ultralytics import YOLO
+    ML_QR_DETECTION_AVAILABLE = True
+except ImportError as e:
+    st.warning("Machine learning QR detection is disabled due to missing 'ultralytics'. Install 'ultralytics' for enhanced QR code region detection.")
+    ML_QR_DETECTION_AVAILABLE = False
 
 DB_PATH = "qr_gallery.db"
 MAX_FILE_SIZE_MB = 5
+MODEL_PATH = "yolo_qr.pt"  # Placeholder for pre-trained YOLO model
 
 # -------------------------------
 # Helper Functions
@@ -50,6 +57,23 @@ def preprocess_image(cv2_img):
     thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
     return thresh
 
+def detect_qr_region(cv2_img):
+    """Detect QR code region using YOLOv8."""
+    if not ML_QR_DETECTION_AVAILABLE:
+        return None
+    try:
+        model = YOLO("yolov8n.pt")  # Use a lightweight pre-trained YOLOv8 model
+        results = model(cv2_img, classes=[0], conf=0.5)  # Adjust class ID and confidence as needed
+        for result in results:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            if len(boxes) > 0:
+                x1, y1, x2, y2 = map(int, boxes[0][:4])
+                return (x1, y1, x2-x1, y2-y1)
+        return None
+    except Exception as e:
+        st.warning(f"ML QR detection failed: {str(e)}")
+        return None
+
 def read_qr_code(file, zoom_region=None):
     """Read QR code from an uploaded image file with preprocessing and optional zoom region."""
     if not QR_CODE_AVAILABLE:
@@ -62,13 +86,32 @@ def read_qr_code(file, zoom_region=None):
             st.warning(f"Failed to decode image {file.name}.")
             return None, None
 
+        # Try ML-based QR region detection
+        qr_region = detect_qr_region(cv2_img) if ML_QR_DETECTION_AVAILABLE else None
+        if qr_region:
+            x, y, w, h = qr_region
+            crop = cv2_img[y:y+h, x:x+w]
+            if crop.size > 0:
+                qr_codes = pyzbar.decode(crop)
+                if qr_codes:
+                    return qr_codes[0].data.decode('utf-8'), crop
+                crop_preprocessed = preprocess_image(crop)
+                qr_codes = pyzbar.decode(crop_preprocessed)
+                if qr_codes:
+                    return qr_codes[0].data.decode('utf-8'), crop_preprocessed
+
         # Apply zoom region if provided
         if zoom_region:
             x, y, w, h = zoom_region
-            cv2_img = cv2_img[y:y+h, x:x+w]
-            if cv2_img.size == 0:
-                st.warning("Zoomed region is invalid or empty.")
-                return None, None
+            crop = cv2_img[y:y+h, x:x+w]
+            if crop.size > 0:
+                qr_codes = pyzbar.decode(crop)
+                if qr_codes:
+                    return qr_codes[0].data.decode('utf-8'), crop
+                crop_preprocessed = preprocess_image(crop)
+                qr_codes = pyzbar.decode(crop_preprocessed)
+                if qr_codes:
+                    return qr_codes[0].data.decode('utf-8'), crop_preprocessed
 
         # Try original image
         qr_codes = pyzbar.decode(cv2_img)
@@ -123,19 +166,16 @@ def zoom_image(img, zoom_level, center_x, center_y):
     zoom_factor = max(1.0, zoom_level)
     new_width, new_height = int(width / zoom_factor), int(height / zoom_factor)
     
-    # Calculate crop region centered on (center_x, center_y)
     x0 = max(0, int(center_x * width - new_width // 2))
     y0 = max(0, int(center_y * height - new_height // 2))
     x1 = min(width, x0 + new_width)
     y1 = min(height, y0 + new_height)
     
-    # Adjust if crop goes out of bounds
     if x1 - x0 < new_width:
         x0 = max(0, x1 - new_width)
     if y1 - y0 < new_height:
         y0 = max(0, y1 - new_height)
     
-    # Crop and resize to maintain display size
     cropped = img.crop((x0, y0, x1, y1))
     zoomed = cropped.resize((width, height), Image.LANCZOS)
     return zoomed, (x0, y0, x1-x0, y1-y0)
@@ -367,6 +407,16 @@ if st.session_state.zoom_folder is None:
                         st.session_state.zoom_level = 1.0
                         st.session_state.zoom_center_x = 0.5
                         st.session_state.zoom_center_y = 0.5
+                        # Try ML-based QR region detection to initialize zoom
+                        if ML_QR_DETECTION_AVAILABLE and QR_CODE_AVAILABLE:
+                            file = io.BytesIO(img_dict["data"])
+                            cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
+                            qr_region = detect_qr_region(cv2_img)
+                            if qr_region:
+                                x, y, w, h = qr_region
+                                st.session_state.zoom_center_x = (x + w/2) / cv2_img.shape[1]
+                                st.session_state.zoom_center_y = (y + h/2) / cv2_img.shape[0]
+                                st.session_state.zoom_level = max(1.0, min(5.0, cv2_img.shape[1] / w))
                         st.rerun()
                     st.image(img_dict["image"], use_container_width=True, caption=f"Photo {idx+1}")
                     qr_display = img_dict["qr_content"] if img_dict["qr_content"] else "No QR code detected"
@@ -412,7 +462,6 @@ else:
         qr_content, processed_img = read_qr_code(file, zoom_region=(zoom_region[0], zoom_region[1], zoom_region[2], zoom_region[3]))
         if qr_content:
             qr_display = qr_content
-            # Update database with new QR content if detected
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             c.execute("UPDATE images SET qr_content = ? WHERE folder = ? AND name = ?",
@@ -423,7 +472,30 @@ else:
             with st.expander("Show Preprocessed Zoomed Image"):
                 processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
                 st.image(processed_pil, caption="Preprocessed Zoomed Image")
-    
+
+    # Try ML-based QR detection if no QR code found
+    if QR_CODE_AVAILABLE and ML_QR_DETECTION_AVAILABLE and not qr_display:
+        file = io.BytesIO(img_dict["data"])
+        cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
+        qr_region = detect_qr_region(cv2_img)
+        if qr_region:
+            file.seek(0)
+            qr_content, processed_img = read_qr_code(file, zoom_region=qr_region)
+            if qr_content:
+                qr_display = qr_content
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("UPDATE images SET qr_content = ? WHERE folder = ? AND name = ?",
+                          (qr_content, folder, img_dict["name"]))
+                conn.commit()
+                conn.close()
+                # Update zoom to focus on detected QR region
+                x, y, w, h = qr_region
+                st.session_state.zoom_center_x = (x + w/2) / cv2_img.shape[1]
+                st.session_state.zoom_center_y = (y + h/2) / cv2_img.shape[0]
+                st.session_state.zoom_level = max(1.0, min(5.0, cv2_img.shape[1] / w))
+                st.rerun()
+
     st.markdown(f'<b>QR Content:</b> {qr_display}', unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns([1, 8, 1])
