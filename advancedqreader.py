@@ -50,44 +50,64 @@ def validate_file(file):
         return False
     return True
 
-def preprocess_image(cv2_img):
+def preprocess_image(cv2_img, method="default"):
     """Preprocess image to improve QR code detection."""
     try:
         gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-        return thresh
+        if method == "contrast":
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
+        elif method == "edge":
+            gray = cv2.Canny(gray, 100, 200)
+        elif method == "bilateral":
+            gray = cv2.bilateralFilter(gray, 11, 17, 17)
+            gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        else:
+            gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        return gray
     except Exception as e:
-        st.warning(f"Image preprocessing failed: {str(e)}")
+        st.warning(f"Image preprocessing ({method}) failed: {str(e)}")
         return cv2_img
 
 def detect_qr_region(cv2_img):
-    """Detect QR code region using YOLOv8 or OpenCV."""
+    """Detect QR code region using YOLOv8, OpenCV, or contour detection with confidence scoring."""
     height, width = cv2_img.shape[:2]
-    
+    best_region = None
+    best_zoom_level = 1.0
+    best_center_x = 0.5
+    best_center_y = 0.5
+    best_confidence = 0.0
+
     # Try YOLOv8 first if available
     if ML_QR_DETECTION_AVAILABLE:
         try:
             model_path = MODEL_PATH if os.path.exists(MODEL_PATH) else "yolov8n.pt"
             model = YOLO(model_path)
-            results = model(cv2_img, classes=[0], conf=0.5)  # Adjust class ID and confidence
+            results = model(cv2_img, classes=[0], conf=0.5)
             for result in results:
                 boxes = result.boxes.xyxy.cpu().numpy()
-                if len(boxes) > 0:
-                    x1, y1, x2, y2 = map(int, boxes[0][:4])
+                confidences = result.boxes.conf.cpu().numpy()
+                for box, conf in zip(boxes, confidences):
+                    x1, y1, x2, y2 = map(int, box[:4])
                     w, h = x2 - x1, y2 - y1
-                    if w > 0 and h > 0:
+                    if w > 0 and h > 0 and 0.8 < w/h < 1.2:  # Square-like region
                         center_x = (x1 + w/2) / width
                         center_y = (y1 + h/2) / height
                         zoom_level = max(1.0, min(5.0, width / w))
-                        return (x1, y1, w, h), zoom_level, center_x, center_y
+                        if conf > best_confidence:
+                            best_confidence = conf
+                            best_region = (x1, y1, w, h)
+                            best_zoom_level = zoom_level
+                            best_center_x = center_x
+                            best_center_y = center_y
         except Exception as e:
             st.warning(f"ML QR detection failed: {str(e)}")
-    
-    # Fallback to OpenCV QRCodeDetector
-    if QR_CODE_AVAILABLE:
+
+    # Try OpenCV QRCodeDetector
+    if QR_CODE_AVAILABLE and best_confidence < 0.9:  # Only if YOLO confidence is low
         try:
             detector = cv2.QRCodeDetector()
-            _, points = detector.detect(cv2_img)
+            retval, points, _ = detector.detectAndDecode(cv2_img)  # Handle three return values
             if points is not None and len(points) > 0:
                 points = points[0]
                 x1, y1 = min(points[:, 0]), min(points[:, 1])
@@ -97,10 +117,42 @@ def detect_qr_region(cv2_img):
                     center_x = (x1 + w/2) / width
                     center_y = (y1 + h/2) / height
                     zoom_level = max(1.0, min(5.0, width / w))
-                    return (x1, y1, w, h), zoom_level, center_x, center_y
+                    confidence = 0.9 if retval else 0.7  # High confidence if QR decoded
+                    if confidence > best_confidence:
+                        best_confidence = confidence
+                        best_region = (x1, y1, w, h)
+                        best_zoom_level = zoom_level
+                        best_center_x = center_x
+                        best_center_y = center_y
         except Exception as e:
             st.warning(f"OpenCV QR region detection failed: {str(e)}")
-    
+
+    # Try contour-based detection with preprocessing
+    if QR_CODE_AVAILABLE and best_confidence < 0.8:  # Only if previous methods are not confident
+        for method in ["default", "contrast", "bilateral"]:
+            try:
+                preprocessed = preprocess_image(cv2_img, method=method)
+                contours, _ = cv2.findContours(preprocessed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for contour in contours:
+                    area = cv2.contourArea(contour)
+                    if area > (width * height * 0.01):  # Minimum area
+                        x, y, w, h = cv2.boundingRect(contour)
+                        if 0.8 < w/h < 1.2 and w > width * 0.1:  # Square-like, >10% image width
+                            center_x = (x + w/2) / width
+                            center_y = (y + h/2) / height
+                            zoom_level = max(1.0, min(5.0, width / w))
+                            confidence = min(0.7, area / (width * height))  # Confidence based on area
+                            if confidence > best_confidence:
+                                best_confidence = confidence
+                                best_region = (x, y, w, h)
+                                best_zoom_level = zoom_level
+                                best_center_x = center_x
+                                best_center_y = center_y
+            except Exception as e:
+                st.warning(f"Contour detection ({method}) failed: {str(e)}")
+
+    if best_region:
+        return best_region, best_zoom_level, best_center_x, best_center_y
     return None, 1.0, 0.5, 0.5
 
 def read_qr_code(file, zoom_region=None):
@@ -112,45 +164,60 @@ def read_qr_code(file, zoom_region=None):
         bytes_data = file.getvalue()
         cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
         if cv2_img is None:
-            st.warning(f"Failed to decode image.")
+            st.warning("Failed to decode image.")
             return None, None
 
         detector = cv2.QRCodeDetector()
+        processed_img = cv2_img.copy()
 
         # Try provided zoom region
         if zoom_region:
             x, y, w, h = zoom_region
             crop = cv2_img[y:y+h, x:x+w]
             if crop.size > 0:
-                qr_content, points = detector.detectAndDecode(crop)
+                qr_content, points, _ = detector.detectAndDecode(crop)  # Handle three return values
                 if qr_content:
-                    return qr_content, crop
-                crop_preprocessed = preprocess_image(crop)
-                qr_content, points = detector.detectAndDecode(crop_preprocessed)
-                if qr_content:
-                    return qr_content, crop_preprocessed
+                    if points is not None:
+                        points = [(int(p[0] + x), int(p[1] + y)) for p in points[0]]
+                        cv2.polylines(processed_img, [np.array(points)], True, (0, 255, 0), 3)  # Green, thicker
+                    return qr_content, processed_img
+                for method in ["default", "contrast", "bilateral"]:
+                    crop_preprocessed = preprocess_image(crop, method=method)
+                    qr_content, points, _ = detector.detectAndDecode(crop_preprocessed)
+                    if qr_content:
+                        if points is not None:
+                            points = [(int(p[0] + x), int(p[1] + y)) for p in points[0]]
+                            cv2.polylines(processed_img, [np.array(points)], True, (0, 255, 0), 3)
+                        return qr_content, processed_img
+            else:
+                cv2.rectangle(processed_img, (x, y), (x+w, y+h), (0, 0, 255), 3)  # Red for failed region
 
-        # Try original image
-        qr_content, points = detector.detectAndDecode(cv2_img)
-        if qr_content:
-            return qr_content, cv2_img
-
-        # Try preprocessed image
-        preprocessed = preprocess_image(cv2_img)
-        qr_content, points = detector.detectAndDecode(preprocessed)
-        if qr_content:
-            return qr_content, preprocessed
+        # Try multiple preprocessing methods
+        for method in ["default", "contrast", "bilateral"]:
+            preprocessed = preprocess_image(cv2_img, method=method)
+            qr_content, points, _ = detector.detectAndDecode(preprocessed)
+            if qr_content:
+                if points is not None:
+                    cv2.polylines(processed_img, [np.array(points)], True, (0, 255, 0), 3)
+                return qr_content, processed_img
 
         # Try resizing
         for scale in [0.5, 1.5, 2.0]:
             resized = cv2.resize(cv2_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            qr_content, points = detector.detectAndDecode(resized)
+            qr_content, points, _ = detector.detectAndDecode(resized)
             if qr_content:
-                return qr_content, resized
-            resized_preprocessed = preprocess_image(resized)
-            qr_content, points = detector.detectAndDecode(resized_preprocessed)
-            if qr_content:
-                return qr_content, resized_preprocessed
+                if points is not None:
+                    points = [(int(p[0]/scale), int(p[1]/scale)) for p in points[0]]
+                    cv2.polylines(processed_img, [np.array(points)], True, (0, 255, 0), 3)
+                return qr_content, processed_img
+            for method in ["default", "contrast", "bilateral"]:
+                resized_preprocessed = preprocess_image(resized, method=method)
+                qr_content, points, _ = detector.detectAndDecode(resized_preprocessed)
+                if qr_content:
+                    if points is not None:
+                        points = [(int(p[0]/scale), int(p[1]/scale)) for p in points[0]]
+                        cv2.polylines(processed_img, [np.array(points)], True, (0, 255, 0), 3)
+                    return qr_content, processed_img
 
         # Try cropping regions
         height, width = cv2_img.shape[:2]
@@ -161,21 +228,32 @@ def read_qr_code(file, zoom_region=None):
             (width//2, height//2, width, height),  # Bottom-right
         ]
         for (x, y, w, h) in regions:
-            crop = cv2_img[y:h, x:w]
+            crop = cv2_img[y:y+h, x:x+w]
             if crop.size == 0:
                 continue
-            qr_content, points = detector.detectAndDecode(crop)
+            qr_content, points, _ = detector.detectAndDecode(crop)
             if qr_content:
-                return qr_content, crop
-            crop_preprocessed = preprocess_image(crop)
-            qr_content, points = detector.detectAndDecode(crop_preprocessed)
-            if qr_content:
-                return qr_content, crop_preprocessed
+                if points is not None:
+                    points = [(int(p[0] + x), int(p[1] + y)) for p in points[0]]
+                    cv2.polylines(processed_img, [np.array(points)], True, (0, 255, 0), 3)
+                return qr_content, processed_img
+            for method in ["default", "contrast", "bilateral"]:
+                crop_preprocessed = preprocess_image(crop, method=method)
+                qr_content, points, _ = detector.detectAndDecode(crop_preprocessed)
+                if qr_content:
+                    if points is not None:
+                        points = [(int(p[0] + x), int(p[1] + y)) for p in points[0]]
+                        cv2.polylines(processed_img, [np.array(points)], True, (0, 255, 0), 3)
+                    return qr_content, processed_img
 
-        return None, cv2_img
+        # Draw red bounding box for failed detection
+        if zoom_region:
+            x, y, w, h = zoom_region
+            cv2.rectangle(processed_img, (x, y), (x+w, y+h), (0, 0, 255), 3)  # Red for failure
+        return None, processed_img
     except Exception as e:
         st.warning(f"Error reading QR code: {str(e)}")
-        return None, None
+        return None, cv2_img
 
 def zoom_image(img, zoom_level, center_x, center_y):
     """Apply zoom to a PIL image and return the zoomed region."""
@@ -350,7 +428,6 @@ with st.sidebar:
 
     if st.session_state.is_admin:
         st.subheader("Manage Folders & Images")
-        # Add Folder
         with st.form(key="add_folder_form"):
             new_folder = st.text_input("Folder Name (e.g., 'newfolder')", key="new_folder_input")
             new_name = st.text_input("Display Name", key="new_name_input")
@@ -363,13 +440,12 @@ with st.sidebar:
                 else:
                     st.error("Folder Name and Display Name are required.")
 
-        # Upload Images
         data = load_folders()
         folder_choice = st.selectbox("Select Folder", [item["folder"] for item in data], key="upload_folder_select")
         uploaded_files = st.file_uploader(
             "Upload QR Code Images", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'], key="upload_files"
         )
-        debug_preprocessed = st.checkbox("Show preprocessed images (Admin)", key="debug_preprocessed")
+        debug_preprocessed = st.checkbox("Show processed images with QR bounding box (Admin)", key="debug_preprocessed")
         if st.button("Upload Images", key="upload_button") and uploaded_files:
             uploaded_count = load_images_to_db(uploaded_files, folder_choice)
             st.success(f"{uploaded_count} image(s) uploaded to '{folder_choice}'!")
@@ -382,7 +458,7 @@ with st.sidebar:
                         st.write(f"**{file.name} QR Content:** No QR code detected")
                     if debug_preprocessed and processed_img is not None and st.session_state.is_admin:
                         processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
-                        st.image(processed_pil, caption=f"Preprocessed {file.name}", use_container_width=True)
+                        st.image(processed_pil, caption=f"Processed {file.name} with QR Bounding Box", use_container_width=True)
 
 # -------------------------------
 # CSS Styling
@@ -426,7 +502,6 @@ if st.session_state.zoom_folder is None:
                     if st.button("🔍 View", key=f"view_{f['folder']}_{idx}"):
                         st.session_state.zoom_folder = f["folder"]
                         st.session_state.zoom_index = idx
-                        # Automatically detect QR region
                         if QR_CODE_AVAILABLE:
                             file = io.BytesIO(img_dict["data"])
                             cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
@@ -480,10 +555,12 @@ else:
                       (qr_content, folder, img_dict["name"]))
             conn.commit()
             conn.close()
+        else:
+            st.warning("No QR code detected in the zoomed region. Try uploading a clearer image or adjusting the image manually.")
         if st.session_state.is_admin and processed_img is not None:
-            with st.expander("Show Preprocessed Zoomed Image"):
+            with st.expander("Show Processed Image with QR Bounding Box"):
                 processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
-                st.image(processed_pil, caption="Preprocessed Zoomed Image")
+                st.image(processed_pil, caption="Processed Image with QR Bounding Box (Green: Detected, Red: Not Detected)")
 
     st.markdown(f'<b>QR Content:</b> {qr_display}', unsafe_allow_html=True)
 
@@ -491,7 +568,6 @@ else:
     with col1:
         if idx > 0 and st.button("◄ Previous", key=f"prev_{folder}_{idx}"):
             st.session_state.zoom_index -= 1
-            # Reset for next image
             if QR_CODE_AVAILABLE:
                 file = io.BytesIO(images[st.session_state.zoom_index]["data"])
                 cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
@@ -507,7 +583,6 @@ else:
     with col3:
         if idx < len(images)-1 and st.button("Next ►", key=f"next_{folder}_{idx}"):
             st.session_state.zoom_index += 1
-            # Reset for next image
             if QR_CODE_AVAILABLE:
                 file = io.BytesIO(images[st.session_state.zoom_index]["data"])
                 cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
