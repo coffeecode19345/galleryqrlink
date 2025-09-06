@@ -7,12 +7,11 @@ import mimetypes
 import base64
 import os
 try:
-    from pyzbar import pyzbar
     import cv2
     import numpy as np
     QR_CODE_AVAILABLE = True
 except ImportError as e:
-    st.error(f"QR code reading is disabled due to missing dependencies: {str(e)}. Install 'pyzbar', 'opencv-python', and ensure 'libzbar0' is installed.")
+    st.error(f"QR code reading is disabled due to missing 'opencv-python': {str(e)}. Install 'opencv-python' to enable QR code detection.")
     QR_CODE_AVAILABLE = False
 try:
     from ultralytics import YOLO
@@ -80,7 +79,7 @@ def detect_qr_region(cv2_img):
         return None
 
 def read_qr_code(file, zoom_region=None):
-    """Read QR code from an uploaded image file with preprocessing and optional zoom region."""
+    """Read QR code from an uploaded image file using OpenCV's QRCodeDetector."""
     if not QR_CODE_AVAILABLE:
         return None, None
     try:
@@ -91,54 +90,56 @@ def read_qr_code(file, zoom_region=None):
             st.warning(f"Failed to decode image {file.name}.")
             return None, None
 
+        detector = cv2.QRCodeDetector()
+
         # Try ML-based QR region detection
         qr_region = detect_qr_region(cv2_img) if ML_QR_DETECTION_AVAILABLE else None
         if qr_region:
             x, y, w, h = qr_region
             crop = cv2_img[y:y+h, x:x+w]
             if crop.size > 0:
-                qr_codes = pyzbar.decode(crop)
-                if qr_codes:
-                    return qr_codes[0].data.decode('utf-8'), crop
+                qr_content, points = detector.detectAndDecode(crop)
+                if qr_content:
+                    return qr_content, crop
                 crop_preprocessed = preprocess_image(crop)
-                qr_codes = pyzbar.decode(crop_preprocessed)
-                if qr_codes:
-                    return qr_codes[0].data.decode('utf-8'), crop_preprocessed
+                qr_content, points = detector.detectAndDecode(crop_preprocessed)
+                if qr_content:
+                    return qr_content, crop_preprocessed
 
         # Apply zoom region if provided
         if zoom_region:
             x, y, w, h = zoom_region
             crop = cv2_img[y:y+h, x:x+w]
             if crop.size > 0:
-                qr_codes = pyzbar.decode(crop)
-                if qr_codes:
-                    return qr_codes[0].data.decode('utf-8'), crop
+                qr_content, points = detector.detectAndDecode(crop)
+                if qr_content:
+                    return qr_content, crop
                 crop_preprocessed = preprocess_image(crop)
-                qr_codes = pyzbar.decode(crop_preprocessed)
-                if qr_codes:
-                    return qr_codes[0].data.decode('utf-8'), crop_preprocessed
+                qr_content, points = detector.detectAndDecode(crop_preprocessed)
+                if qr_content:
+                    return qr_content, crop_preprocessed
 
         # Try original image
-        qr_codes = pyzbar.decode(cv2_img)
-        if qr_codes:
-            return qr_codes[0].data.decode('utf-8'), cv2_img
+        qr_content, points = detector.detectAndDecode(cv2_img)
+        if qr_content:
+            return qr_content, cv2_img
 
         # Try preprocessed image
         preprocessed = preprocess_image(cv2_img)
-        qr_codes = pyzbar.decode(preprocessed)
-        if qr_codes:
-            return qr_codes[0].data.decode('utf-8'), preprocessed
+        qr_content, points = detector.detectAndDecode(preprocessed)
+        if qr_content:
+            return qr_content, preprocessed
 
         # Try resizing
         for scale in [0.5, 1.5, 2.0]:
             resized = cv2.resize(cv2_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            qr_codes = pyzbar.decode(resized)
-            if qr_codes:
-                return qr_codes[0].data.decode('utf-8'), resized
+            qr_content, points = detector.detectAndDecode(resized)
+            if qr_content:
+                return qr_content, resized
             resized_preprocessed = preprocess_image(resized)
-            qr_codes = pyzbar.decode(resized_preprocessed)
-            if qr_codes:
-                return qr_codes[0].data.decode('utf-8'), resized_preprocessed
+            qr_content, points = detector.detectAndDecode(resized_preprocessed)
+            if qr_content:
+                return qr_content, resized_preprocessed
 
         # Try cropping regions
         height, width = cv2_img.shape[:2]
@@ -152,13 +153,13 @@ def read_qr_code(file, zoom_region=None):
             crop = cv2_img[y:h, x:w]
             if crop.size == 0:
                 continue
-            qr_codes = pyzbar.decode(crop)
-            if qr_codes:
-                return qr_codes[0].data.decode('utf-8'), crop
+            qr_content, points = detector.detectAndDecode(crop)
+            if qr_content:
+                return qr_content, crop
             crop_preprocessed = preprocess_image(crop)
-            qr_codes = pyzbar.decode(crop_preprocessed)
-            if qr_codes:
-                return qr_codes[0].data.decode('utf-8'), crop_preprocessed
+            qr_content, points = detector.detectAndDecode(crop_preprocessed)
+            if qr_content:
+                return qr_content, crop_preprocessed
 
         return None, cv2_img
     except Exception as e:
@@ -391,7 +392,7 @@ img {border-radius:4px; max-width:100px; object-fit:cover;}
 st.title("📸 QR Code Image Manager")
 
 if not QR_CODE_AVAILABLE:
-    st.error("QR code functionality is disabled. Ensure 'pyzbar', 'opencv-python', and 'libzbar0' are installed. See Streamlit Cloud logs or local setup instructions.")
+    st.error("QR code functionality is disabled. Install 'opencv-python' to enable QR code detection.")
 if not ML_QR_DETECTION_AVAILABLE:
     st.warning("Machine learning QR detection is disabled. Install 'ultralytics' for enhanced detection.")
 
