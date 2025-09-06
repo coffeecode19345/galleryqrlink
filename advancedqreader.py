@@ -44,19 +44,72 @@ def validate_file(file):
         return False
     return True
 
+def preprocess_image(cv2_img):
+    """Preprocess image to improve QR code detection."""
+    # Convert to grayscale
+    gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
+    # Apply adaptive thresholding
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    return thresh
+
 def read_qr_code(file):
-    """Read QR code from an uploaded image file."""
+    """Read QR code from an uploaded image file with preprocessing."""
     if not QR_CODE_AVAILABLE:
-        return None
+        return None, None
     try:
         file.seek(0)
         bytes_data = file.getvalue()
         cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
+        if cv2_img is None:
+            st.warning(f"Failed to decode image {file.name}.")
+            return None, None
+
+        # Try original image
         qr_codes = pyzbar.decode(cv2_img)
-        return qr_codes[0].data.decode('utf-8') if qr_codes else None
+        if qr_codes:
+            return qr_codes[0].data.decode('utf-8'), cv2_img
+
+        # Try preprocessed image
+        preprocessed = preprocess_image(cv2_img)
+        qr_codes = pyzbar.decode(preprocessed)
+        if qr_codes:
+            return qr_codes[0].data.decode('utf-8'), preprocessed
+
+        # Try resizing (for small QR codes)
+        for scale in [0.5, 1.5, 2.0]:
+            resized = cv2.resize(cv2_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            qr_codes = pyzbar.decode(resized)
+            if qr_codes:
+                return qr_codes[0].data.decode('utf-8'), resized
+            # Try preprocessed resized image
+            resized_preprocessed = preprocess_image(resized)
+            qr_codes = pyzbar.decode(resized_preprocessed)
+            if qr_codes:
+                return qr_codes[0].data.decode('utf-8'), resized_preprocessed
+
+        # Try cropping regions (for QR codes in parts of the image)
+        height, width = cv2_img.shape[:2]
+        regions = [
+            (0, 0, width//2, height//2),  # Top-left
+            (width//2, 0, width, height//2),  # Top-right
+            (0, height//2, width//2, height),  # Bottom-left
+            (width//2, height//2, width, height),  # Bottom-right
+        ]
+        for (x, y, w, h) in regions:
+            crop = cv2_img[y:h, x:w]
+            qr_codes = pyzbar.decode(crop)
+            if qr_codes:
+                return qr_codes[0].data.decode('utf-8'), crop
+            # Try preprocessed crop
+            crop_preprocessed = preprocess_image(crop)
+            qr_codes = pyzbar.decode(crop_preprocessed)
+            if qr_codes:
+                return qr_codes[0].data.decode('utf-8'), crop_preprocessed
+
+        return None, cv2_img
     except Exception as e:
         st.warning(f"Error reading QR code from {file.name}: {str(e)}")
-        return None
+        return None, None
 
 def init_db():
     """Initialize SQLite database with folders and images tables."""
@@ -139,7 +192,7 @@ def load_images_to_db(uploaded_files, folder):
             image_data = uploaded_file.read()
             extension = os.path.splitext(uploaded_file.name)[1].lower()
             random_filename = f"{uuid.uuid4()}{extension}"
-            qr_content = read_qr_code(uploaded_file)
+            qr_content, _ = read_qr_code(uploaded_file)
             c.execute("SELECT COUNT(*) FROM images WHERE folder = ? AND name = ?", (folder, random_filename))
             if c.fetchone()[0] == 0:
                 c.execute("INSERT INTO images (name, folder, image_data, qr_content) VALUES (?, ?, ?, ?)",
@@ -224,16 +277,21 @@ with st.sidebar:
         uploaded_files = st.file_uploader(
             "Upload QR Code Images", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'], key="upload_files"
         )
+        debug_preprocessed = st.checkbox("Show preprocessed images (Admin)", key="debug_preprocessed")
         if st.button("Upload Images", key="upload_button") and uploaded_files:
             uploaded_count = load_images_to_db(uploaded_files, folder_choice)
             st.success(f"{uploaded_count} image(s) uploaded to '{folder_choice}'!")
             if QR_CODE_AVAILABLE:
                 for file in uploaded_files:
-                    qr_content = read_qr_code(file)
+                    qr_content, processed_img = read_qr_code(file)
                     if qr_content:
                         st.write(f"**{file.name} QR Content:** {qr_content}")
                     else:
                         st.write(f"**{file.name} QR Content:** No QR code detected")
+                    if debug_preprocessed and processed_img is not None and st.session_state.is_admin:
+                        # Convert OpenCV image to PIL for Streamlit display
+                        processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
+                        st.image(processed_pil, caption=f"Preprocessed {file.name}", use_container_width=True)
 
 # -------------------------------
 # CSS Styling
