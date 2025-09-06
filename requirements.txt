@@ -1,5 +1,5 @@
-pillow
-pyzbar
-opencv-python
 streamlit>=1.30.0
-ultralytics
+pillow>=9.0.0
+pyzbar>=0.1.9
+opencv-python>=4.6.0
+ultralytics>=8.0.0
