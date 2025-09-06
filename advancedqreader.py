@@ -7,11 +7,12 @@ import mimetypes
 import base64
 import os
 import numpy as np
+import tempfile
 
 # Check for QR code dependencies
 try:
-    from pyzbar import pyzbar
     import cv2
+    # Use OpenCV's built-in QR code detector (available in OpenCV 4.x)
     QR_CODE_AVAILABLE = True
 except ImportError:
     QR_CODE_AVAILABLE = False
@@ -97,7 +98,7 @@ def detect_qr_region(cv2_img):
         return None
 
 def read_qr_code(file, zoom_region=None):
-    """Read QR code from an uploaded image file."""
+    """Read QR code from an uploaded image file using OpenCV's QR code detector."""
     if not QR_CODE_AVAILABLE:
         return None, None
         
@@ -108,6 +109,9 @@ def read_qr_code(file, zoom_region=None):
         if cv2_img is None:
             return None, None
 
+        # Initialize OpenCV QR Code detector
+        qr_detector = cv2.QRCodeDetector()
+        
         # Try ML-based QR region detection if available
         qr_region = detect_qr_region(cv2_img) if ML_QR_DETECTION_AVAILABLE else None
         
@@ -116,27 +120,27 @@ def read_qr_code(file, zoom_region=None):
             x, y, w, h = zoom_region
             crop = cv2_img[y:y+h, x:x+w]
             if crop.size > 0:
-                qr_codes = pyzbar.decode(crop)
-                if qr_codes:
-                    return qr_codes[0].data.decode('utf-8'), crop
+                decoded_text, points = qr_detector.detectAndDecode(crop)
+                if decoded_text:
+                    return decoded_text, crop
                 
                 crop_preprocessed = preprocess_image(crop)
                 if crop_preprocessed is not None:
-                    qr_codes = pyzbar.decode(crop_preprocessed)
-                    if qr_codes:
-                        return qr_codes[0].data.decode('utf-8'), crop_preprocessed
+                    decoded_text, points = qr_detector.detectAndDecode(crop_preprocessed)
+                    if decoded_text:
+                        return decoded_text, crop_preprocessed
 
         # Try original image
-        qr_codes = pyzbar.decode(cv2_img)
-        if qr_codes:
-            return qr_codes[0].data.decode('utf-8'), cv2_img
+        decoded_text, points = qr_detector.detectAndDecode(cv2_img)
+        if decoded_text:
+            return decoded_text, cv2_img
 
         # Try preprocessed image
         preprocessed = preprocess_image(cv2_img)
         if preprocessed is not None:
-            qr_codes = pyzbar.decode(preprocessed)
-            if qr_codes:
-                return qr_codes[0].data.decode('utf-8'), preprocessed
+            decoded_text, points = qr_detector.detectAndDecode(preprocessed)
+            if decoded_text:
+                return decoded_text, preprocessed
 
         return None, cv2_img
     except Exception:
@@ -425,7 +429,7 @@ if not QR_CODE_AVAILABLE:
     st.markdown("""
     <div class="warning-box">
     ⚠️ QR code reading is disabled due to missing dependencies. 
-    Install 'pyzbar' and 'opencv-python' and ensure 'libzbar0' is installed.
+    Install 'opencv-python' for QR code detection.
     </div>
     """, unsafe_allow_html=True)
 
