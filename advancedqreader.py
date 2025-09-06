@@ -46,14 +46,12 @@ def validate_file(file):
 
 def preprocess_image(cv2_img):
     """Preprocess image to improve QR code detection."""
-    # Convert to grayscale
     gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
-    # Apply adaptive thresholding
     thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
     return thresh
 
-def read_qr_code(file):
-    """Read QR code from an uploaded image file with preprocessing."""
+def read_qr_code(file, zoom_region=None):
+    """Read QR code from an uploaded image file with preprocessing and optional zoom region."""
     if not QR_CODE_AVAILABLE:
         return None, None
     try:
@@ -63,6 +61,14 @@ def read_qr_code(file):
         if cv2_img is None:
             st.warning(f"Failed to decode image {file.name}.")
             return None, None
+
+        # Apply zoom region if provided
+        if zoom_region:
+            x, y, w, h = zoom_region
+            cv2_img = cv2_img[y:y+h, x:x+w]
+            if cv2_img.size == 0:
+                st.warning("Zoomed region is invalid or empty.")
+                return None, None
 
         # Try original image
         qr_codes = pyzbar.decode(cv2_img)
@@ -75,19 +81,18 @@ def read_qr_code(file):
         if qr_codes:
             return qr_codes[0].data.decode('utf-8'), preprocessed
 
-        # Try resizing (for small QR codes)
+        # Try resizing
         for scale in [0.5, 1.5, 2.0]:
             resized = cv2.resize(cv2_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             qr_codes = pyzbar.decode(resized)
             if qr_codes:
                 return qr_codes[0].data.decode('utf-8'), resized
-            # Try preprocessed resized image
             resized_preprocessed = preprocess_image(resized)
             qr_codes = pyzbar.decode(resized_preprocessed)
             if qr_codes:
                 return qr_codes[0].data.decode('utf-8'), resized_preprocessed
 
-        # Try cropping regions (for QR codes in parts of the image)
+        # Try cropping regions
         height, width = cv2_img.shape[:2]
         regions = [
             (0, 0, width//2, height//2),  # Top-left
@@ -97,10 +102,11 @@ def read_qr_code(file):
         ]
         for (x, y, w, h) in regions:
             crop = cv2_img[y:h, x:w]
+            if crop.size == 0:
+                continue
             qr_codes = pyzbar.decode(crop)
             if qr_codes:
                 return qr_codes[0].data.decode('utf-8'), crop
-            # Try preprocessed crop
             crop_preprocessed = preprocess_image(crop)
             qr_codes = pyzbar.decode(crop_preprocessed)
             if qr_codes:
@@ -110,6 +116,29 @@ def read_qr_code(file):
     except Exception as e:
         st.warning(f"Error reading QR code from {file.name}: {str(e)}")
         return None, None
+
+def zoom_image(img, zoom_level, center_x, center_y):
+    """Apply zoom to a PIL image and return the zoomed region."""
+    width, height = img.size
+    zoom_factor = max(1.0, zoom_level)
+    new_width, new_height = int(width / zoom_factor), int(height / zoom_factor)
+    
+    # Calculate crop region centered on (center_x, center_y)
+    x0 = max(0, int(center_x * width - new_width // 2))
+    y0 = max(0, int(center_y * height - new_height // 2))
+    x1 = min(width, x0 + new_width)
+    y1 = min(height, y0 + new_height)
+    
+    # Adjust if crop goes out of bounds
+    if x1 - x0 < new_width:
+        x0 = max(0, x1 - new_width)
+    if y1 - y0 < new_height:
+        y0 = max(0, y1 - new_height)
+    
+    # Crop and resize to maintain display size
+    cropped = img.crop((x0, y0, x1, y1))
+    zoomed = cropped.resize((width, height), Image.LANCZOS)
+    return zoomed, (x0, y0, x1-x0, y1-y0)
 
 def init_db():
     """Initialize SQLite database with folders and images tables."""
@@ -237,6 +266,12 @@ if "zoom_index" not in st.session_state:
     st.session_state.zoom_index = 0
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
+if "zoom_level" not in st.session_state:
+    st.session_state.zoom_level = 1.0
+if "zoom_center_x" not in st.session_state:
+    st.session_state.zoom_center_x = 0.5
+if "zoom_center_y" not in st.session_state:
+    st.session_state.zoom_center_y = 0.5
 
 # -------------------------------
 # Sidebar: Admin Controls
@@ -289,7 +324,6 @@ with st.sidebar:
                     else:
                         st.write(f"**{file.name} QR Content:** No QR code detected")
                     if debug_preprocessed and processed_img is not None and st.session_state.is_admin:
-                        # Convert OpenCV image to PIL for Streamlit display
                         processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
                         st.image(processed_pil, caption=f"Preprocessed {file.name}", use_container_width=True)
 
@@ -330,6 +364,9 @@ if st.session_state.zoom_folder is None:
                     if st.button("🔍 View", key=f"view_{f['folder']}_{idx}"):
                         st.session_state.zoom_folder = f["folder"]
                         st.session_state.zoom_index = idx
+                        st.session_state.zoom_level = 1.0
+                        st.session_state.zoom_center_x = 0.5
+                        st.session_state.zoom_center_y = 0.5
                         st.rerun()
                     st.image(img_dict["image"], use_container_width=True, caption=f"Photo {idx+1}")
                     qr_display = img_dict["qr_content"] if img_dict["qr_content"] else "No QR code detected"
@@ -353,18 +390,56 @@ else:
     img_dict = images[idx]
 
     st.subheader(f"🔍 Viewing {folder} ({idx+1}/{len(images)})")
-    st.image(img_dict["image"], use_container_width=True)
+    
+    # Image Magnifier Controls
+    zoom_level = st.slider("Zoom Level", 1.0, 5.0, st.session_state.zoom_level, 0.1, key=f"zoom_level_{folder}_{idx}")
+    center_x = st.slider("Horizontal Center", 0.0, 1.0, st.session_state.zoom_center_x, 0.01, key=f"center_x_{folder}_{idx}")
+    center_y = st.slider("Vertical Center", 0.0, 1.0, st.session_state.zoom_center_y, 0.01, key=f"center_y_{folder}_{idx}")
+    
+    # Update session state
+    st.session_state.zoom_level = zoom_level
+    st.session_state.zoom_center_x = center_x
+    st.session_state.zoom_center_y = center_y
+    
+    # Apply zoom
+    zoomed_image, zoom_region = zoom_image(img_dict["image"], zoom_level, center_x, center_y)
+    st.image(zoomed_image, use_container_width=True, caption="Zoomed Image")
+    
+    # Try QR code detection in zoomed region
     qr_display = img_dict["qr_content"] if img_dict["qr_content"] else "No QR code detected"
+    if QR_CODE_AVAILABLE and zoom_level > 1.0:
+        file = io.BytesIO(img_dict["data"])
+        qr_content, processed_img = read_qr_code(file, zoom_region=(zoom_region[0], zoom_region[1], zoom_region[2], zoom_region[3]))
+        if qr_content:
+            qr_display = qr_content
+            # Update database with new QR content if detected
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("UPDATE images SET qr_content = ? WHERE folder = ? AND name = ?",
+                      (qr_content, folder, img_dict["name"]))
+            conn.commit()
+            conn.close()
+        if st.session_state.is_admin and processed_img is not None:
+            with st.expander("Show Preprocessed Zoomed Image"):
+                processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
+                st.image(processed_pil, caption="Preprocessed Zoomed Image")
+    
     st.markdown(f'<b>QR Content:</b> {qr_display}', unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns([1, 8, 1])
     with col1:
         if idx > 0 and st.button("◄ Previous", key=f"prev_{folder}_{idx}"):
             st.session_state.zoom_index -= 1
+            st.session_state.zoom_level = 1.0
+            st.session_state.zoom_center_x = 0.5
+            st.session_state.zoom_center_y = 0.5
             st.rerun()
     with col3:
         if idx < len(images)-1 and st.button("Next ►", key=f"next_{folder}_{idx}"):
             st.session_state.zoom_index += 1
+            st.session_state.zoom_level = 1.0
+            st.session_state.zoom_center_x = 0.5
+            st.session_state.zoom_center_y = 0.5
             st.rerun()
 
     mime, _ = mimetypes.guess_type(img_dict["name"])
@@ -389,4 +464,7 @@ else:
     if st.button("⬅️ Back to Grid", key=f"back_{folder}_{idx}"):
         st.session_state.zoom_folder = None
         st.session_state.zoom_index = 0
+        st.session_state.zoom_level = 1.0
+        st.session_state.zoom_center_x = 0.5
+        st.session_state.zoom_center_y = 0.5
         st.rerun()
