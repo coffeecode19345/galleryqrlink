@@ -11,7 +11,7 @@ try:
     import numpy as np
     QR_CODE_AVAILABLE = True
 except ImportError as e:
-    st.error(f"QR code reading is disabled due to missing 'opencv-python': {str(e)}. Install 'opencv-python' to enable QR code detection.")
+    st.error(f"QR code reading is disabled due to missing 'opencv-python': {str(e)}. Install 'opencv-python' and required system libraries (e.g., libgl1-mesa-glx, libglib2.0-0 on Linux).")
     QR_CODE_AVAILABLE = False
 try:
     from ultralytics import YOLO
@@ -35,18 +35,18 @@ def validate_file(file):
     """Validate uploaded file size and type."""
     file_size_bytes = len(file.getvalue())
     if file_size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024:
-        st.error(f"File '{file.name}' exceeds {MAX_FILE_SIZE_MB}MB limit.")
+        st.error(f"File '{getattr(file, 'name', 'unknown')}' exceeds {MAX_FILE_SIZE_MB}MB limit.")
         return False
-    file_type = file.type if hasattr(file, 'type') and file.type else os.path.splitext(file.name)[1].lower()
+    file_type = file.type if hasattr(file, 'type') and file.type else os.path.splitext(getattr(file, 'name', ''))[1].lower()
     if file_type not in ['image/jpeg', 'image/png', '.jpg', '.jpeg', '.png']:
-        st.error(f"File '{file.name}' must be JPG or PNG.")
+        st.error(f"File '{getattr(file, 'name', 'unknown')}' must be JPG or PNG.")
         return False
     try:
         file.seek(0)
         Image.open(file).verify()
         file.seek(0)
     except Exception as e:
-        st.error(f"File '{file.name}' is invalid or corrupted: {str(e)}")
+        st.error(f"File '{getattr(file, 'name', 'unknown')}' is invalid or corrupted: {str(e)}")
         return False
     return True
 
@@ -61,22 +61,47 @@ def preprocess_image(cv2_img):
         return cv2_img
 
 def detect_qr_region(cv2_img):
-    """Detect QR code region using YOLOv8."""
-    if not ML_QR_DETECTION_AVAILABLE:
-        return None
-    try:
-        model_path = MODEL_PATH if os.path.exists(MODEL_PATH) else "yolov8n.pt"
-        model = YOLO(model_path)
-        results = model(cv2_img, classes=[0], conf=0.5)  # Adjust class ID and confidence
-        for result in results:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            if len(boxes) > 0:
-                x1, y1, x2, y2 = map(int, boxes[0][:4])
-                return (x1, y1, x2-x1, y2-y1)
-        return None
-    except Exception as e:
-        st.warning(f"ML QR detection failed: {str(e)}")
-        return None
+    """Detect QR code region using YOLOv8 or OpenCV."""
+    height, width = cv2_img.shape[:2]
+    
+    # Try YOLOv8 first if available
+    if ML_QR_DETECTION_AVAILABLE:
+        try:
+            model_path = MODEL_PATH if os.path.exists(MODEL_PATH) else "yolov8n.pt"
+            model = YOLO(model_path)
+            results = model(cv2_img, classes=[0], conf=0.5)  # Adjust class ID and confidence
+            for result in results:
+                boxes = result.boxes.xyxy.cpu().numpy()
+                if len(boxes) > 0:
+                    x1, y1, x2, y2 = map(int, boxes[0][:4])
+                    w, h = x2 - x1, y2 - y1
+                    if w > 0 and h > 0:
+                        center_x = (x1 + w/2) / width
+                        center_y = (y1 + h/2) / height
+                        zoom_level = max(1.0, min(5.0, width / w))
+                        return (x1, y1, w, h), zoom_level, center_x, center_y
+        except Exception as e:
+            st.warning(f"ML QR detection failed: {str(e)}")
+    
+    # Fallback to OpenCV QRCodeDetector
+    if QR_CODE_AVAILABLE:
+        try:
+            detector = cv2.QRCodeDetector()
+            _, points = detector.detect(cv2_img)
+            if points is not None and len(points) > 0:
+                points = points[0]
+                x1, y1 = min(points[:, 0]), min(points[:, 1])
+                x2, y2 = max(points[:, 0]), max(points[:, 1])
+                w, h = x2 - x1, y2 - y1
+                if w > 0 and h > 0:
+                    center_x = (x1 + w/2) / width
+                    center_y = (y1 + h/2) / height
+                    zoom_level = max(1.0, min(5.0, width / w))
+                    return (x1, y1, w, h), zoom_level, center_x, center_y
+        except Exception as e:
+            st.warning(f"OpenCV QR region detection failed: {str(e)}")
+    
+    return None, 1.0, 0.5, 0.5
 
 def read_qr_code(file, zoom_region=None):
     """Read QR code from an uploaded image file using OpenCV's QRCodeDetector."""
@@ -87,26 +112,12 @@ def read_qr_code(file, zoom_region=None):
         bytes_data = file.getvalue()
         cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
         if cv2_img is None:
-            st.warning(f"Failed to decode image {file.name}.")
+            st.warning(f"Failed to decode image.")
             return None, None
 
         detector = cv2.QRCodeDetector()
 
-        # Try ML-based QR region detection
-        qr_region = detect_qr_region(cv2_img) if ML_QR_DETECTION_AVAILABLE else None
-        if qr_region:
-            x, y, w, h = qr_region
-            crop = cv2_img[y:y+h, x:x+w]
-            if crop.size > 0:
-                qr_content, points = detector.detectAndDecode(crop)
-                if qr_content:
-                    return qr_content, crop
-                crop_preprocessed = preprocess_image(crop)
-                qr_content, points = detector.detectAndDecode(crop_preprocessed)
-                if qr_content:
-                    return qr_content, crop_preprocessed
-
-        # Apply zoom region if provided
+        # Try provided zoom region
         if zoom_region:
             x, y, w, h = zoom_region
             crop = cv2_img[y:y+h, x:x+w]
@@ -163,7 +174,7 @@ def read_qr_code(file, zoom_region=None):
 
         return None, cv2_img
     except Exception as e:
-        st.warning(f"Error reading QR code from {file.name}: {str(e)}")
+        st.warning(f"Error reading QR code: {str(e)}")
         return None, None
 
 def zoom_image(img, zoom_level, center_x, center_y):
@@ -392,7 +403,7 @@ img {border-radius:4px; max-width:100px; object-fit:cover;}
 st.title("📸 QR Code Image Manager")
 
 if not QR_CODE_AVAILABLE:
-    st.error("QR code functionality is disabled. Install 'opencv-python' to enable QR code detection.")
+    st.error("QR code functionality is disabled. Install 'opencv-python' and required system libraries (e.g., libgl1-mesa-glx, libglib2.0-0 on Linux).")
 if not ML_QR_DETECTION_AVAILABLE:
     st.warning("Machine learning QR detection is disabled. Install 'ultralytics' for enhanced detection.")
 
@@ -415,19 +426,18 @@ if st.session_state.zoom_folder is None:
                     if st.button("🔍 View", key=f"view_{f['folder']}_{idx}"):
                         st.session_state.zoom_folder = f["folder"]
                         st.session_state.zoom_index = idx
-                        st.session_state.zoom_level = 1.0
-                        st.session_state.zoom_center_x = 0.5
-                        st.session_state.zoom_center_y = 0.5
-                        # Try ML-based QR region detection to initialize zoom
-                        if ML_QR_DETECTION_AVAILABLE and QR_CODE_AVAILABLE:
+                        # Automatically detect QR region
+                        if QR_CODE_AVAILABLE:
                             file = io.BytesIO(img_dict["data"])
                             cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
-                            qr_region = detect_qr_region(cv2_img)
-                            if qr_region:
-                                x, y, w, h = qr_region
-                                st.session_state.zoom_center_x = (x + w/2) / cv2_img.shape[1]
-                                st.session_state.zoom_center_y = (y + h/2) / cv2_img.shape[0]
-                                st.session_state.zoom_level = max(1.0, min(5.0, cv2_img.shape[1] / w))
+                            qr_region, zoom_level, center_x, center_y = detect_qr_region(cv2_img)
+                            st.session_state.zoom_level = zoom_level
+                            st.session_state.zoom_center_x = center_x
+                            st.session_state.zoom_center_y = center_y
+                        else:
+                            st.session_state.zoom_level = 1.0
+                            st.session_state.zoom_center_x = 0.5
+                            st.session_state.zoom_center_y = 0.5
                         st.rerun()
                     st.image(img_dict["image"], use_container_width=True, caption=f"Photo {idx+1}")
                     qr_display = img_dict["qr_content"] if img_dict["qr_content"] else "No QR code detected"
@@ -451,24 +461,15 @@ else:
     img_dict = images[idx]
 
     st.subheader(f"🔍 Viewing {folder} ({idx+1}/{len(images)})")
-    
-    # Image Magnifier Controls
-    zoom_level = st.slider("Zoom Level", 1.0, 5.0, st.session_state.zoom_level, 0.1, key=f"zoom_level_{folder}_{idx}")
-    center_x = st.slider("Horizontal Center", 0.0, 1.0, st.session_state.zoom_center_x, 0.01, key=f"center_x_{folder}_{idx}")
-    center_y = st.slider("Vertical Center", 0.0, 1.0, st.session_state.zoom_center_y, 0.01, key=f"center_y_{folder}_{idx}")
-    
-    # Update session state
-    st.session_state.zoom_level = zoom_level
-    st.session_state.zoom_center_x = center_x
-    st.session_state.zoom_center_y = center_y
-    
-    # Apply zoom
-    zoomed_image, zoom_region = zoom_image(img_dict["image"], zoom_level, center_x, center_y)
-    st.image(zoomed_image, use_container_width=True, caption="Zoomed Image")
+
+    # Apply automatic zoom
+    zoomed_image, zoom_region = zoom_image(img_dict["image"], st.session_state.zoom_level, 
+                                          st.session_state.zoom_center_x, st.session_state.zoom_center_y)
+    st.image(zoomed_image, use_container_width=True, caption="Automatically Zoomed QR Code Region")
     
     # Try QR code detection in zoomed region
     qr_display = img_dict["qr_content"] if img_dict["qr_content"] else "No QR code detected"
-    if QR_CODE_AVAILABLE and zoom_level > 1.0:
+    if QR_CODE_AVAILABLE:
         file = io.BytesIO(img_dict["data"])
         qr_content, processed_img = read_qr_code(file, zoom_region=(zoom_region[0], zoom_region[1], zoom_region[2], zoom_region[3]))
         if qr_content:
@@ -484,44 +485,40 @@ else:
                 processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
                 st.image(processed_pil, caption="Preprocessed Zoomed Image")
 
-    # Try ML-based QR detection if no QR code found
-    if QR_CODE_AVAILABLE and ML_QR_DETECTION_AVAILABLE and not qr_display:
-        file = io.BytesIO(img_dict["data"])
-        cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
-        qr_region = detect_qr_region(cv2_img)
-        if qr_region:
-            file.seek(0)
-            qr_content, processed_img = read_qr_code(file, zoom_region=qr_region)
-            if qr_content:
-                qr_display = qr_content
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute("UPDATE images SET qr_content = ? WHERE folder = ? AND name = ?",
-                          (qr_content, folder, img_dict["name"]))
-                conn.commit()
-                conn.close()
-                x, y, w, h = qr_region
-                st.session_state.zoom_center_x = (x + w/2) / cv2_img.shape[1]
-                st.session_state.zoom_center_y = (y + h/2) / cv2_img.shape[0]
-                st.session_state.zoom_level = max(1.0, min(5.0, cv2_img.shape[1] / w))
-                st.rerun()
-
     st.markdown(f'<b>QR Content:</b> {qr_display}', unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns([1, 8, 1])
     with col1:
         if idx > 0 and st.button("◄ Previous", key=f"prev_{folder}_{idx}"):
             st.session_state.zoom_index -= 1
-            st.session_state.zoom_level = 1.0
-            st.session_state.zoom_center_x = 0.5
-            st.session_state.zoom_center_y = 0.5
+            # Reset for next image
+            if QR_CODE_AVAILABLE:
+                file = io.BytesIO(images[st.session_state.zoom_index]["data"])
+                cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
+                qr_region, zoom_level, center_x, center_y = detect_qr_region(cv2_img)
+                st.session_state.zoom_level = zoom_level
+                st.session_state.zoom_center_x = center_x
+                st.session_state.zoom_center_y = center_y
+            else:
+                st.session_state.zoom_level = 1.0
+                st.session_state.zoom_center_x = 0.5
+                st.session_state.zoom_center_y = 0.5
             st.rerun()
     with col3:
         if idx < len(images)-1 and st.button("Next ►", key=f"next_{folder}_{idx}"):
             st.session_state.zoom_index += 1
-            st.session_state.zoom_level = 1.0
-            st.session_state.zoom_center_x = 0.5
-            st.session_state.zoom_center_y = 0.5
+            # Reset for next image
+            if QR_CODE_AVAILABLE:
+                file = io.BytesIO(images[st.session_state.zoom_index]["data"])
+                cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
+                qr_region, zoom_level, center_x, center_y = detect_qr_region(cv2_img)
+                st.session_state.zoom_level = zoom_level
+                st.session_state.zoom_center_x = center_x
+                st.session_state.zoom_center_y = center_y
+            else:
+                st.session_state.zoom_level = 1.0
+                st.session_state.zoom_center_x = 0.5
+                st.session_state.zoom_center_y = 0.5
             st.rerun()
 
     mime, _ = mimetypes.guess_type(img_dict["name"])
