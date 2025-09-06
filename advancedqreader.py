@@ -6,9 +6,14 @@ import uuid
 import mimetypes
 import base64
 import os
-from pyzbar import pyzbar
-import cv2
-import numpy as np
+try:
+    from pyzbar import pyzbar
+    import cv2
+    import numpy as np
+    QR_CODE_AVAILABLE = True
+except ImportError as e:
+    st.warning("QR code reading is disabled due to missing dependencies. Install 'pyzbar' and 'opencv-python' and ensure 'libzbar0' is installed.")
+    QR_CODE_AVAILABLE = False
 
 DB_PATH = "qr_gallery.db"
 MAX_FILE_SIZE_MB = 5
@@ -41,6 +46,8 @@ def validate_file(file):
 
 def read_qr_code(file):
     """Read QR code from an uploaded image file."""
+    if not QR_CODE_AVAILABLE:
+        return None
     try:
         file.seek(0)
         bytes_data = file.getvalue()
@@ -220,13 +227,13 @@ with st.sidebar:
         if st.button("Upload Images", key="upload_button") and uploaded_files:
             uploaded_count = load_images_to_db(uploaded_files, folder_choice)
             st.success(f"{uploaded_count} image(s) uploaded to '{folder_choice}'!")
-            for file in uploaded_files:
-                qr_content = read_qr_code(file)
-                if qr_content:
-                    st.write(f"**{file.name} QR Content:** {qr_content}")
-                else:
-                    st.write(f"**{file.name} QR Content:** No QR code detected")
-            st.rerun()
+            if QR_CODE_AVAILABLE:
+                for file in uploaded_files:
+                    qr_content = read_qr_code(file)
+                    if qr_content:
+                        st.write(f"**{file.name} QR Content:** {qr_content}")
+                    else:
+                        st.write(f"**{file.name} QR Content:** No QR code detected")
 
 # -------------------------------
 # CSS Styling
